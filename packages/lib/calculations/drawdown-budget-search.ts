@@ -1,8 +1,10 @@
-import { replayBook, type BookReplayInput, type BookMember } from "./book-replay.ts";
+import { replayBook } from "./book-replay.ts";
+import type { BookReplayInput, BookMember, BookReplayResult } from "./book-replay.ts";
 import { resampleStationaryBlocks } from "./monte-carlo.ts";
 
 export interface DrawdownBudgetSearchInput {
   replay: BookReplayInput;
+  feasible?: (replay: BookReplayResult) => boolean | { ok: false; reason: string };
   weightBounds: Record<string, { min: number; max: number }>;
   weightScaling: "allocationAndContracts" | "capitalPerContractInverse";
   initialWeights: Array<Record<string, number>>;
@@ -32,6 +34,7 @@ export interface BookSearchEvaluation {
   maxDrawdownPct: number | null;
   insolvent: boolean;
   feasible: boolean;
+  feasibilityRejectionReason?: string;
   executedGroups: number;
   executedIgnoredOnlyGroups: number;
   roundedToZero: string[];
@@ -80,7 +83,7 @@ export interface DrawdownBudgetSearchResult {
   weightRanges: Record<string, { min: number; max: number }>;
   termination: "budget" | "step_ladder_exhausted" | "calibration_refusal";
   cardinalityUpperBound: number;
-  declarations: DrawdownBudgetSearchInput;
+  declarations: Omit<DrawdownBudgetSearchInput, "feasible">;
   dropOne: Array<{
     memberId: string;
     redundant: boolean;
@@ -90,6 +93,7 @@ export interface DrawdownBudgetSearchResult {
   }>;
   stability: BookSearchStability;
   totalEvaluations: number;
+  feasibilityRejections?: { count: number; reasons: Record<string, number> };
   warnings: string[];
 }
 
@@ -107,6 +111,9 @@ export function searchBookAtDrawdown(input: DrawdownBudgetSearchInput): Drawdown
   const limit = input.targetDrawdownPct - input.calibrationMarginPct;
   const evaluations: BookSearchEvaluation[] = [];
   const cache = new Map<string, BookSearchEvaluation>();
+  const feasibilityRejections: DrawdownBudgetSearchResult["feasibilityRejections"] = input.feasible
+    ? { count: 0, reasons: Object.create(null) as Record<string, number> }
+    : undefined;
   const prepare = (requested: Record<string, number>): PreparedBookEvaluation => {
     const weights: Record<string, number> = {};
     const members: Record<string, BookMember> = {};
@@ -177,6 +184,31 @@ export function searchBookAtDrawdown(input: DrawdownBudgetSearchInput): Drawdown
         risk.maxDrawdownPct <= limit,
       roundedToZero,
     };
+    if (input.feasible) {
+      const accepted = input.feasible(replay);
+      if (
+        accepted !== true &&
+        accepted !== false &&
+        (typeof accepted !== "object" ||
+          accepted === null ||
+          Array.isArray(accepted) ||
+          accepted.ok !== false ||
+          typeof accepted.reason !== "string" ||
+          accepted.reason.trim().length === 0)
+      ) {
+        const type =
+          accepted === null ? "null" : Array.isArray(accepted) ? "array" : typeof accepted;
+        throw new RangeError(`Invalid drawdown search: feasible returned ${type}`);
+      }
+      if (accepted !== true) {
+        const reason = accepted === false ? "caller_feasibility" : accepted.reason;
+        candidate.feasible = false;
+        candidate.feasibilityRejectionReason = reason;
+        feasibilityRejections!.count++;
+        const reasons = feasibilityRejections!.reasons;
+        reasons[reason] = (reasons[reason] ?? 0) + 1;
+      }
+    }
     cache.set(key, candidate);
     evaluations.push(candidate);
     return candidate;
@@ -301,7 +333,22 @@ export function searchBookAtDrawdown(input: DrawdownBudgetSearchInput): Drawdown
       (n, p) => n + p.replicates.reduce((m, r) => m + (r.search?.k ?? 0), 0),
       0,
     );
-  return {
+  if (feasibilityRejections) {
+    const merge = (search: DrawdownBudgetSearchResult) => {
+      const rejected = search.feasibilityRejections;
+      if (!rejected) return;
+      feasibilityRejections.count += rejected.count;
+      for (const reason in rejected.reasons)
+        feasibilityRejections.reasons[reason] =
+          (feasibilityRejections.reasons[reason] ?? 0) + rejected.reasons[reason];
+    };
+    for (const drop of dropOne) merge(drop.search);
+    for (const panel of stability.panels)
+      for (const replicate of panel.replicates) if (replicate.search) merge(replicate.search);
+  }
+  const declarations = input.feasible ? { ...input } : input;
+  if (input.feasible) delete declarations.feasible;
+  const result: DrawdownBudgetSearchResult = {
     status: reason ? "refused" : "ok",
     reason,
     drawdownBasis: input.replay.marks ? "offline_marked_equity" : "offline_closed_equity",
@@ -326,7 +373,7 @@ export function searchBookAtDrawdown(input: DrawdownBudgetSearchInput): Drawdown
           1),
       1,
     ),
-    declarations: input,
+    declarations,
     dropOne,
     stability,
     totalEvaluations,
@@ -340,6 +387,8 @@ export function searchBookAtDrawdown(input: DrawdownBudgetSearchInput): Drawdown
         : []),
     ],
   };
+  if (feasibilityRejections) result.feasibilityRejections = feasibilityRejections;
+  return result;
 }
 
 function validateSearch(input: DrawdownBudgetSearchInput): void {
@@ -353,6 +402,7 @@ function validateSearch(input: DrawdownBudgetSearchInput): void {
     typeof input.dropOne !== "boolean"
   )
     fail("declarations");
+  if (input.feasible !== undefined && typeof input.feasible !== "function") fail("feasible");
   if (!["allocationAndContracts", "capitalPerContractInverse"].includes(input.weightScaling))
     fail("weightScaling");
   if (
