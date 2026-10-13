@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   buildRealizedEquityCurveByCloseDate,
   buildRealizedDrawdownSeries,
@@ -95,6 +96,236 @@ describe("public close-date realized calculations", () => {
     });
     expect(result?.drawdownPeriod.maxDrawdownPct).toBeCloseTo((500 / 1100) * 100);
     expect(result?.maxDrawdownPct).toBe(result?.drawdownPeriod.maxDrawdownPct);
+  });
+
+  it("ranks distinct recovered and final episodes with sequence-only attribution", () => {
+    const tape = [
+      trade("2026-01-05", "2026-01-05", 100, "Peak"),
+      trade("2026-01-05", "2026-01-05", -200, "B"),
+      trade("2026-01-05", "2026-01-05", 50, "A"),
+      trade("2026-01-05", "2026-01-05", -150, "B"),
+      trade("2026-01-06", "2026-01-06", 300, "Recovery"),
+      trade("2026-01-07", "2026-01-07", -300, "C"),
+    ];
+    const result = buildRealizedDrawdownAttributionByCloseDate(tape, 1, 20);
+    expect(result?.episodes).toEqual([
+      {
+        drawdownPeriod: {
+          peakDate: "2026-01-05",
+          troughDate: "2026-01-05",
+          peakEquity: 1100,
+          troughEquity: 800,
+          maxDrawdown: 300,
+          maxDrawdownPct: (300 / 1100) * 100,
+          durationDays: 0,
+          recoveryDate: "2026-01-06",
+        },
+        periodStats: { totalTrades: 3, totalPl: -300 },
+        attribution: [
+          {
+            strategy: "B",
+            pl: -350,
+            trades: 2,
+            wins: 0,
+            losses: 2,
+            contributionPct: (350 / 300) * 100,
+          },
+        ],
+      },
+      {
+        drawdownPeriod: {
+          peakDate: "2026-01-06",
+          troughDate: "2026-01-07",
+          peakEquity: 1100,
+          troughEquity: 800,
+          maxDrawdown: 300,
+          maxDrawdownPct: (300 / 1100) * 100,
+          durationDays: 1,
+          recoveryDate: null,
+        },
+        periodStats: { totalTrades: 1, totalPl: -300 },
+        attribution: [
+          { strategy: "C", pl: -300, trades: 1, wins: 0, losses: 1, contributionPct: 100 },
+        ],
+      },
+    ]);
+    expect(buildRealizedDrawdownAttributionByCloseDate(tape, 5, 1)?.episodes).toHaveLength(1);
+  });
+
+  it("preserves the literal legacy byte baseline when episodeCount is omitted", () => {
+    expect(JSON.stringify(buildRealizedDrawdownAttributionByCloseDate(trades, 1))).toBe(
+      '{"maxDrawdownPct":18.181818181818183,"peakDateStr":"2026-02-02","troughDateStr":"2026-02-03","drawdownPeriod":{"peakDate":"2026-02-02","troughDate":"2026-02-03","peakEquity":1100,"troughEquity":900,"maxDrawdown":200,"maxDrawdownPct":18.181818181818183,"durationDays":1},"periodStats":{"totalTrades":2,"totalPl":-100},"attribution":[{"strategy":"B","pl":-200,"trades":1,"wins":0,"losses":1,"contributionPct":200}]}',
+    );
+  });
+
+  it("includes the initial seed, crosses zero, and ranks dollars rather than percentages", () => {
+    const tape = [
+      trade("2026-01-05", "2026-01-05", -1200, "B"),
+      trade("2026-01-06", "2026-01-06", 11200, "A"),
+      trade("2026-01-07", "2026-01-07", -2000, "C"),
+    ];
+    expect(buildRealizedDrawdownAttributionByCloseDate(tape, 5, 2)?.episodes).toMatchObject([
+      {
+        drawdownPeriod: {
+          peakEquity: 11000,
+          troughEquity: 9000,
+          maxDrawdown: 2000,
+          recoveryDate: null,
+        },
+        periodStats: { totalTrades: 1, totalPl: -2000 },
+      },
+      {
+        drawdownPeriod: {
+          peakEquity: 1000,
+          troughEquity: -200,
+          maxDrawdown: 1200,
+          maxDrawdownPct: 120,
+          recoveryDate: "2026-01-06",
+        },
+        periodStats: { totalTrades: 1, totalPl: -1200 },
+      },
+    ]);
+  });
+
+  it("uses the latest same-day equal peak and excludes all peak/pre-peak trades", () => {
+    const tape = [100, -100, 100, -200].map((pl, index) => ({
+      ...trade("2026-01-05", "2026-01-05", pl, String(index)),
+      timeClosed: `15:0${index}:00`,
+    }));
+    const episodes = buildRealizedDrawdownAttributionByCloseDate(
+      [...tape].reverse(),
+      5,
+      2,
+    )?.episodes;
+    expect(episodes?.map((episode) => episode.periodStats)).toEqual([
+      { totalTrades: 1, totalPl: -200 },
+      { totalTrades: 1, totalPl: -100 },
+    ]);
+    expect(episodes?.[0].attribution).toEqual([
+      { strategy: "3", pl: -200, trades: 1, wins: 0, losses: 1, contributionPct: 100 },
+    ]);
+    expect(buildRealizedDrawdownAttributionByCloseDate([trades[0]], 5, 2)).toBeNull();
+  });
+
+  it.each([0, 21, 1.5, NaN, Infinity])("refuses invalid episode count %s", (count) => {
+    expect(() => buildRealizedDrawdownAttributionByCloseDate(trades, 5, count)).toThrow(RangeError);
+  });
+
+  it.each([0, -100])("reports zero percentage depth for a nonpositive peak of %s", (peak) => {
+    const loss = { ...trade("2026-01-05", "2026-01-05", -50), fundsAtClose: peak - 50 };
+    expect(buildRealizedDrawdownAttributionByCloseDate([loss], 5, 1)?.episodes).toMatchObject([
+      {
+        drawdownPeriod: {
+          peakEquity: peak,
+          troughEquity: peak - 50,
+          maxDrawdown: 50,
+          maxDrawdownPct: 0,
+        },
+        periodStats: { totalTrades: 1, totalPl: -50 },
+      },
+    ]);
+  });
+
+  it("keeps the earliest equal trough and stops attribution at that trade", () => {
+    const tape = [
+      trade("2026-01-05", "2026-01-05", 100, "Peak"),
+      trade("2026-01-06", "2026-01-06", -200, "First trough"),
+      trade("2026-01-07", "2026-01-07", 50, "Rebound"),
+      trade("2026-01-08", "2026-01-08", -50, "Equal trough"),
+    ];
+    expect(buildRealizedDrawdownAttributionByCloseDate(tape, 5, 1)?.episodes).toMatchObject([
+      {
+        drawdownPeriod: { troughDate: "2026-01-06", troughEquity: 900 },
+        periodStats: { totalTrades: 1, totalPl: -200 },
+        attribution: [{ strategy: "First trough", pl: -200, trades: 1 }],
+      },
+    ]);
+  });
+
+  it("closes an exact recovery despite binary rounding of decimal P/L", () => {
+    // 1000 - 0.1 - 0.2 + 0.3 is 999.9999999999999 in floating point, yet fully recovered.
+    const tape = [
+      trade("2026-01-05", "2026-01-05", -0.1, "A"),
+      trade("2026-01-06", "2026-01-06", -0.2, "A"),
+      trade("2026-01-07", "2026-01-07", 0.3, "A"),
+      trade("2026-01-08", "2026-01-08", -50, "B"),
+      trade("2026-01-09", "2026-01-09", 50, "B"),
+    ];
+    const episodes = buildRealizedDrawdownAttributionByCloseDate(tape, 5, 5)?.episodes;
+    expect(episodes).toHaveLength(2);
+    expect(episodes?.[0].drawdownPeriod).toMatchObject({
+      troughDate: "2026-01-08",
+      recoveryDate: "2026-01-09",
+    });
+    expect(episodes?.[0].drawdownPeriod.maxDrawdown).toBeCloseTo(50, 9);
+    expect(episodes?.[1].drawdownPeriod).toMatchObject({
+      peakDate: "2026-01-05",
+      troughDate: "2026-01-06",
+      recoveryDate: "2026-01-07",
+    });
+  });
+
+  it("ranks equal-cent depths by earlier peak despite float noise", () => {
+    // Depths are 0.2999999999999545 and 0.3000000000000682: equal in cents.
+    const pls = [10, -0.3, 0.3, 5, -0.1, -0.2, 0.3, 5];
+    const tape = pls.map((pl, i) =>
+      trade(
+        `2026-01-${String(5 + i).padStart(2, "0")}`,
+        `2026-01-${String(5 + i).padStart(2, "0")}`,
+        pl,
+        "A",
+      ),
+    );
+    const episodes = buildRealizedDrawdownAttributionByCloseDate(tape, 5, 2)?.episodes;
+    expect(episodes?.map((episode) => episode.drawdownPeriod.peakDate)).toEqual([
+      "2026-01-05",
+      "2026-01-08",
+    ]);
+  });
+
+  it("keeps the earliest trough when a later one ties it in cents but is lower in float", () => {
+    // Still below the 1000 peak, the second trough evaluates to 999.5999999999999 versus 999.6.
+    const pls = [-0.4, 0.3, -0.1, -0.2, 0.5];
+    const tape = pls.map((pl, i) =>
+      trade(
+        `2026-01-${String(5 + i).padStart(2, "0")}`,
+        `2026-01-${String(5 + i).padStart(2, "0")}`,
+        pl,
+        "A",
+      ),
+    );
+    const [episode] = buildRealizedDrawdownAttributionByCloseDate(tape, 5, 1)?.episodes ?? [];
+    expect(episode.drawdownPeriod.troughDate).toBe("2026-01-05");
+    expect(episode.periodStats.totalTrades).toBe(1);
+  });
+
+  it("preserves local-midnight calendar keys when UTC slicing would shift the day", () => {
+    const output = execFileSync(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "-e",
+        `
+      import { buildRealizedDrawdownAttributionByCloseDate } from "@tradeblocks/lib";
+      const dates = [5, 6, 7].map(day => new Date(2026, 0, day));
+      const tape = [100, -200, 200].map((pl, index) => ({
+        dateOpened: dates[index], dateClosed: dates[index], pl,
+        fundsAtClose: 1000 + pl, strategy: "A",
+      }));
+      const result = buildRealizedDrawdownAttributionByCloseDate(tape, 5, 1);
+      console.log(JSON.stringify({
+        utcDates: dates.map(date => date.toISOString().slice(0, 10)),
+        period: result.episodes[0].drawdownPeriod,
+      }));
+    `,
+      ],
+      { cwd: process.cwd(), env: { ...process.env, TZ: "Pacific/Kiritimati" }, encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toMatchObject({
+      utcDates: ["2026-01-04", "2026-01-05", "2026-01-06"],
+      period: { peakDate: "2026-01-05", troughDate: "2026-01-06", recoveryDate: "2026-01-07" },
+    });
   });
 
   it("accepts an evidenced starting amount without changing direct callers' default", () => {
