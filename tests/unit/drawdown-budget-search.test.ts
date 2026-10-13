@@ -4,7 +4,56 @@ import type {
   BookReplayResult,
   BookSearchCheckpoint,
   DrawdownBudgetSearchInput,
+  DrawdownBudgetSearchResult,
 } from "@tradeblocks/lib";
+
+// Compile-time contracts use the same public seam as runtime callers.
+it("preserves literal objectives and the legacy result annotation", () => {
+  // The bare input type keeps objective required as the legacy literal.
+  const declared: "returnPct" = input().objective;
+  const explicit: "returnPct" = searchBookAtDrawdown({ ...input(), objective: "returnPct" })
+    .declarations.objective;
+  const ratio: "returnOverDrawdown" = searchBookAtDrawdown({
+    ...input(),
+    objective: "returnOverDrawdown",
+  }).declarations.objective;
+  const annotated: DrawdownBudgetSearchResult = searchBookAtDrawdown(input());
+  const annotatedObjective: "returnPct" = annotated.declarations.objective;
+  expect([declared, explicit, ratio, annotatedObjective]).toEqual([
+    "returnPct",
+    "returnPct",
+    "returnOverDrawdown",
+    "returnPct",
+  ]);
+});
+
+it("preserves objective literals for annotated requests and coherent normalized declarations", () => {
+  const legacyRequest: DrawdownBudgetSearchInput = input();
+  legacyRequest.feasible = (replay) => replay.returnPct > 0;
+  const ratioRequest: DrawdownBudgetSearchInput<"returnOverDrawdown"> = {
+    ...input(),
+    objective: "returnOverDrawdown",
+    feasible: legacyRequest.feasible,
+  };
+  const legacyResult = searchBookAtDrawdown(legacyRequest);
+  const ratioResult = searchBookAtDrawdown(ratioRequest);
+  const legacy: "returnPct" = legacyResult.declarations.objective;
+  const ratio: "returnOverDrawdown" = ratioResult.declarations.objective;
+  const legacyDeclarations: DrawdownBudgetSearchResult["declarations"] = legacyResult.declarations;
+  const normalizedLegacy: DrawdownBudgetSearchInput = legacyDeclarations;
+  const ratioDeclarations: DrawdownBudgetSearchResult<"returnOverDrawdown">["declarations"] =
+    ratioResult.declarations;
+  const normalizedRatio: DrawdownBudgetSearchInput<"returnOverDrawdown"> = ratioDeclarations;
+  const legacyPolicy: DrawdownBudgetSearchInput["feasible"] = ratioRequest.feasible;
+  normalizedLegacy.feasible = legacyPolicy;
+  normalizedRatio.feasible = legacyPolicy;
+  expect([legacy, ratio, normalizedLegacy.objective, normalizedRatio.objective]).toEqual([
+    "returnPct",
+    "returnOverDrawdown",
+    "returnPct",
+    "returnOverDrawdown",
+  ]);
+});
 
 it("observes committed progress without changing search results", () => {
   const value = input();
@@ -1132,4 +1181,315 @@ it("keeps policy results structured-cloneable including drop-one and synthetic s
   }
   expect(structuredClone(result)).toEqual(result);
   expect(value.feasible).toBeDefined();
+});
+
+function ratioInput(): DrawdownBudgetSearchInput<"returnPct" | "returnOverDrawdown"> {
+  const value = input();
+  value.replay.members.a.sizing = { mode: "allocation", allocationPercentage: 50 };
+  value.replay.trades[0].netPlPerContract = -20;
+  value.replay.trades[1].netPlPerContract = 100;
+  value.weightBounds.a = { min: 0.5, max: 1 };
+  value.targetDrawdownPct = 20;
+  value.robust = { maxDrawdownPct: 20, shrinkageFactors: [1] };
+  return value;
+}
+
+it("selects the caller's grid-best ratio instead of the highest return", () => {
+  const value = ratioInput();
+  const grid = [0.5, 1].map((weight) =>
+    searchBookAtDrawdown({
+      ...value,
+      weightBounds: { a: { min: weight, max: weight } },
+      initialWeights: [{ a: weight }],
+    }),
+  );
+  expect(grid.map((r) => [r.best!.returnPct, r.best!.maxDrawdownPct])).toEqual([
+    [16, 4],
+    [30, 10],
+  ]);
+  const caller = grid.sort(
+    (a, b) =>
+      b.best!.returnPct / b.best!.maxDrawdownPct! - a.best!.returnPct / a.best!.maxDrawdownPct!,
+  )[0];
+  expect(searchBookAtDrawdown(value).best!.weights).toEqual({ a: 1 });
+  const result = searchBookAtDrawdown({ ...value, objective: "returnOverDrawdown" });
+  expect(result.best!.weights).toEqual(caller.best!.weights);
+  expect(result).toMatchObject({
+    objectiveValue: 4,
+    objectiveTier: "ratio",
+    robust: { weights: { a: 0.5 } },
+    nearOptimal: [{ weights: { a: 0.5 } }],
+  });
+});
+
+it("uses marked drawdown without changing the ceiling or caller feasibility", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.dates.push("2025-01-06");
+  value.replay.trades[0].dateClosed = "2025-01-03";
+  value.replay.trades[1].dateOpened = "2025-01-06";
+  value.replay.trades[1].dateClosed = "2025-01-06";
+  value.replay.marks = {
+    mode: "child",
+    values: [{ tradeId: "loss", date: "2025-01-02", netOpenPlPerContract: -40 }],
+  };
+  value.targetDrawdownPct = 21;
+  const marked = searchBookAtDrawdown(value);
+  expect(marked).toMatchObject({
+    drawdownBasis: "offline_marked_equity",
+    objectiveValue: 2,
+    best: { weights: { a: 0.5 }, returnPct: 16, maxDrawdownPct: 8 },
+  });
+  value.feasible = (r) => r.returnPct >= 20;
+  expect(searchBookAtDrawdown(value)).toMatchObject({
+    objectiveValue: 1.5,
+    best: { weights: { a: 1 }, returnPct: 30, maxDrawdownPct: 20 },
+  });
+  value.targetDrawdownPct = 15;
+  expect(searchBookAtDrawdown(value)).toMatchObject({
+    status: "refused",
+    best: null,
+    objectiveValue: null,
+    objectiveTier: null,
+  });
+});
+
+it("ranks positive zero-drawdown paths first and reports an undefined ratio honestly", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.b = { ...value.replay.members.a, sizing: { mode: "fixed", contracts: 1 } };
+  value.replay.trades.push({
+    ...value.replay.trades[1],
+    id: "b",
+    entryGroupId: "b",
+    memberId: "b",
+  });
+  value.replay.simultaneousOrder.push("b");
+  value.weightBounds = { a: { min: 0, max: 1 }, b: { min: 1, max: 1 } };
+  value.initialWeights = [{ a: 1, b: 1 }];
+  const result = searchBookAtDrawdown(value);
+  expect(result).toMatchObject({
+    best: { weights: { a: 0, b: 1 }, returnPct: 10, maxDrawdownPct: 0 },
+    objectiveTier: "zeroDrawdown",
+    objectiveValue: null,
+  });
+  expect(
+    result.evaluations.some((e) => e.feasible && e.returnPct > 10 && e.maxDrawdownPct! > 0),
+  ).toBe(true);
+  expect(result.nearOptimal.every((e) => e.maxDrawdownPct === 0)).toBe(true);
+  value.replay.trades[1].netPlPerContract = 0;
+  value.replay.trades[2].netPlPerContract = 0;
+  const negative = searchBookAtDrawdown(value);
+  expect(negative).toMatchObject({
+    best: { weights: { a: 1, b: 1 }, returnPct: -10, maxDrawdownPct: 10 },
+    objectiveTier: "ratio",
+    objectiveValue: -1,
+  });
+  expect(
+    negative.evaluations.some((e) => e.feasible && e.returnPct === 0 && e.maxDrawdownPct === 0),
+  ).toBe(true);
+});
+
+it("keeps negative ratios signed and treats a zero-return zero-drawdown path as the last tier", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.trades[1].netPlPerContract = 0;
+  expect(searchBookAtDrawdown(value)).toMatchObject({
+    objectiveValue: -1,
+    objectiveTier: "ratio",
+    best: { weights: { a: 0.5 }, returnPct: -4, maxDrawdownPct: 4 },
+  });
+  value.replay.trades[0].netPlPerContract = 0;
+  expect(searchBookAtDrawdown(value)).toMatchObject({
+    objectiveValue: null,
+    objectiveTier: "nonPositiveReturn",
+    best: { returnPct: 0, maxDrawdownPct: 0 },
+  });
+});
+
+it("inherits ratio ranking in drop-one, stability and sensitivity, including progress and resume", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.b = { ...value.replay.members.a, sizing: { mode: "fixed", contracts: 1 } };
+  value.replay.trades.push(
+    ...value.replay.trades.map((t) => ({
+      ...t,
+      id: `b-${t.id}`,
+      entryGroupId: `b-${t.id}`,
+      memberId: "b",
+    })),
+  );
+  value.replay.simultaneousOrder.push("b");
+  value.weightBounds.b = { min: 0, max: 1 };
+  value.initialWeights = [{ a: 1, b: 1 }];
+  value.dropOne = true;
+  value.stability.replicates = 3;
+  value.stability.sensitivityBlockDays = [1, 3];
+  const progress: Record<string, number | null> = {};
+  const result = searchBookAtDrawdown(value, {
+    onProgress: (e) => {
+      progress[e.scope] = e.best?.weights.a ?? null;
+    },
+  });
+  expect(result.best!.weights).toEqual({ a: 0.5, b: 0 });
+  expect(result.dropOne.find((d) => d.memberId === "b")!.best!.weights.a).toBe(0.5);
+  expect(progress.root).toBe(0.5);
+  expect(progress["dropOne/b"]).toBe(0.5);
+  expect(result.stability.panels.map((p) => p.meanBlockDays)).toEqual([2, 1, 3]);
+  for (const panel of result.stability.panels) {
+    for (const replicate of panel.replicates) {
+      const search = replicate.search!;
+      expect(search.declarations.objective).toBe("returnOverDrawdown");
+      if (replicate.sourceIndices[0] === 0 && replicate.sourceIndices[1] === 1) {
+        expect(search.best!.weights.a).toBe(0.5);
+        expect(search.objectiveValue).toBe(4);
+      }
+    }
+  }
+  const resumed = searchBookAtDrawdown(value, {
+    resumeFrom: JSON.parse(JSON.stringify(result.checkpoint)),
+  });
+  expect(resumed).toEqual(result);
+  expect(() =>
+    searchBookAtDrawdown(
+      { ...value, objective: "returnPct" },
+      {
+        resumeFrom: result.checkpoint,
+      },
+    ),
+  ).toThrow(/search_checkpoint_identity_mismatch/);
+});
+
+it("defaults an untyped omitted objective to legacy return ranking and refuses unknown objectives", () => {
+  const value = ratioInput();
+  const explicit = searchBookAtDrawdown(value);
+  // Typed callers must pass objective; untyped JavaScript callers that omit it get "returnPct".
+  delete (value as Partial<typeof value>).objective;
+  const omitted = searchBookAtDrawdown(value);
+  expect(omitted).toEqual(explicit);
+  expect(omitted).not.toHaveProperty("objectiveValue");
+  expect(() => searchBookAtDrawdown({ ...value, objective: "calmar" as "returnPct" })).toThrow(
+    /declarations/,
+  );
+});
+
+it("refuses an overflowing ratio instead of serializing Infinity as a winning score", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.a.sizing = { mode: "fixed", contracts: 1 };
+  value.weightBounds.a = { min: 1, max: 1 };
+  value.replay.trades[0].netPlPerContract = -1e-10;
+  value.replay.trades[1].netPlPerContract = 1e306;
+  expect(() => searchBookAtDrawdown(value)).toThrow(/non-finite objective ratio/);
+});
+
+it("orders negative closed returns by return when open gains keep marked drawdown at zero", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.b = { ...value.replay.members.a, sizing: { mode: "fixed", contracts: 1 } };
+  value.replay.trades = [
+    value.replay.trades[0],
+    {
+      ...value.replay.trades[1],
+      id: "b",
+      entryGroupId: "b",
+      memberId: "b",
+      dateOpened: "2025-01-02",
+      dateClosed: "2025-01-06",
+    },
+  ];
+  value.replay.simultaneousOrder.push("b");
+  value.weightBounds.b = { min: 1, max: 1 };
+  value.initialWeights = [{ a: 1, b: 1 }];
+  value.replay.marks = {
+    mode: "child",
+    values: value.replay.dates.map((date) => ({
+      tradeId: "b",
+      date,
+      netOpenPlPerContract: 200,
+    })),
+  };
+  expect(searchBookAtDrawdown(value)).toMatchObject({
+    drawdownBasis: "offline_marked_equity",
+    objectiveTier: "nonPositiveReturn",
+    objectiveValue: null,
+    best: { weights: { a: 0.5, b: 1 }, returnPct: -4, maxDrawdownPct: 0 },
+  });
+});
+
+it("rejects return-increasing ratio-degrading moves under a bounded coordinate budget", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.b = { ...value.replay.members.a, sizing: { mode: "fixed", contracts: 2 } };
+  value.replay.trades.push({
+    ...value.replay.trades[1],
+    id: "b",
+    entryGroupId: "b",
+    memberId: "b",
+  });
+  value.replay.simultaneousOrder.push("b");
+  value.weightBounds.b = { min: 0, max: 1 };
+  value.initialWeights = [{ a: 1, b: 1 }];
+  value.maxEvaluations = 4;
+  const result = searchBookAtDrawdown(value);
+  expect(result).toMatchObject({
+    termination: "budget",
+    k: 4,
+    objectiveValue: 6.5,
+    best: { weights: { a: 0.5, b: 0.5 }, returnPct: 26, maxDrawdownPct: 4 },
+  });
+});
+
+it("warns when shrinkage improves the ratio despite reducing realized return", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.weightBounds.a.min = 0;
+  value.maxEvaluations = 3;
+  value.robust.shrinkageFactors = [1, 0.5];
+  const result = searchBookAtDrawdown(value);
+  expect(result).toMatchObject({
+    objectiveValue: 3,
+    best: { weights: { a: 1 }, returnPct: 30, maxDrawdownPct: 10 },
+    robust: { weights: { a: 0.5 }, returnPct: 16, maxDrawdownPct: 4 },
+    robustReturnCostPct: 14,
+  });
+  expect(result.warnings.some((warning) => warning.includes("shrinkage-only"))).toBe(true);
+});
+
+it("keeps high numeric ratios out of a zero-drawdown winner's near-optimal tier", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.members.b = { ...value.replay.members.a, sizing: { mode: "fixed", contracts: 1 } };
+  value.replay.trades.push({
+    ...value.replay.trades[1],
+    id: "b",
+    entryGroupId: "b",
+    memberId: "b",
+    netPlPerContract: 10,
+  });
+  value.replay.simultaneousOrder.push("b");
+  value.weightBounds = { a: { min: 0, max: 1 }, b: { min: 1, max: 1 } };
+  value.initialWeights = [{ a: 1, b: 1 }];
+  const result = searchBookAtDrawdown(value);
+  expect(result).toMatchObject({
+    objectiveTier: "zeroDrawdown",
+    objectiveValue: null,
+    best: { weights: { a: 0, b: 1 }, returnPct: 1, maxDrawdownPct: 0 },
+  });
+  expect(result.nearOptimal.map((e) => e.weights)).toEqual([{ a: 0, b: 1 }]);
+  expect(
+    result.evaluations.some(
+      (e) => e.feasible && e.maxDrawdownPct! > 0 && e.returnPct / e.maxDrawdownPct! > 1,
+    ),
+  ).toBe(true);
+});
+
+it("applies relative near-optimal tolerance to the magnitude of a negative ratio winner", () => {
+  const value = ratioInput();
+  value.objective = "returnOverDrawdown";
+  value.replay.trades[1].netPlPerContract = 0;
+  const result = searchBookAtDrawdown(value);
+  expect(result.objectiveValue).toBe(-1);
+  expect(result.nearOptimal.map((e) => e.weights.a)).toEqual([0.5, 1]);
+  expect(result.weightRanges.a).toEqual({ min: 0.5, max: 1 });
 });

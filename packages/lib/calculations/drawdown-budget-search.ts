@@ -2,7 +2,9 @@ import { replayBook } from "./book-replay.ts";
 import type { BookReplayInput, BookMember, BookReplayResult } from "./book-replay.ts";
 import { resampleStationaryBlocks } from "./monte-carlo.ts";
 
-export interface DrawdownBudgetSearchInput {
+type SearchObjective = "returnPct" | "returnOverDrawdown";
+
+export interface DrawdownBudgetSearchInput<O extends SearchObjective = "returnPct"> {
   replay: BookReplayInput;
   feasible?: (replay: BookReplayResult) => boolean | { ok: false; reason: string };
   weightBounds: Record<string, { min: number; max: number }>;
@@ -17,7 +19,8 @@ export interface DrawdownBudgetSearchInput {
   targetDrawdownPct: number;
   calibrationMarginPct: number;
   calibrationUsable: boolean;
-  objective: "returnPct";
+  /** Required, as before; the bare type keeps the legacy "returnPct" contract. */
+  objective: O;
   nearOptimalRelativeTolerance: number;
   robust: { maxDrawdownPct: number; shrinkageFactors: number[] };
   dropOne: boolean;
@@ -41,7 +44,7 @@ export interface BookSearchEvaluation {
   executedIgnoredOnlyGroups: number;
   roundedToZero: string[];
 }
-export interface BookSearchStability {
+export interface BookSearchStability<O extends SearchObjective = "returnPct"> {
   status: "available" | "disabled" | "unavailable";
   reason: string | null;
   basis: "entry_day_cohorts_with_close_offsets";
@@ -61,13 +64,13 @@ export interface BookSearchStability {
         sourceIndices: number[];
         carriedRows: number;
       } & (
-        | { status: "available"; reason: null; search: DrawdownBudgetSearchResult }
+        | { status: "available"; reason: null; search: DrawdownBudgetSearchResult<O> }
         | { status: "unavailable"; reason: "missing_mark_coverage"; search: null }
       )
     >;
   }>;
 }
-export interface DrawdownBudgetSearchResult {
+export interface DrawdownBudgetSearchResult<O extends SearchObjective = "returnPct"> {
   status: "ok" | "refused";
   reason:
     | "no_feasible_candidate"
@@ -77,6 +80,9 @@ export interface DrawdownBudgetSearchResult {
     | null;
   drawdownBasis: "offline_closed_equity" | "offline_marked_equity";
   best: BookSearchEvaluation | null;
+  /** Ratio metadata is absent for the legacy return objective. */
+  objectiveValue?: number | null;
+  objectiveTier?: "zeroDrawdown" | "ratio" | "nonPositiveReturn" | null;
   robust: BookSearchEvaluation | null;
   robustReturnCostPct: number | null;
   evaluations: BookSearchEvaluation[];
@@ -85,15 +91,18 @@ export interface DrawdownBudgetSearchResult {
   weightRanges: Record<string, { min: number; max: number }>;
   termination: "budget" | "step_ladder_exhausted" | "calibration_refusal";
   cardinalityUpperBound: number;
-  declarations: Omit<DrawdownBudgetSearchInput, "feasible">;
+  /** Normalized request: `objective` is always present (omitted input means "returnPct"). */
+  declarations: Omit<DrawdownBudgetSearchInput<O>, "feasible" | "objective"> & {
+    objective: O;
+  };
   dropOne: Array<{
     memberId: string;
     redundant: boolean;
     best: BookSearchEvaluation | null;
     returnCostPct: number | null;
-    search: DrawdownBudgetSearchResult;
+    search: DrawdownBudgetSearchResult<O>;
   }>;
-  stability: BookSearchStability;
+  stability: BookSearchStability<O>;
   totalEvaluations: number;
   feasibilityRejections?: { count: number; reasons: Record<string, number> };
   warnings: string[];
@@ -163,11 +172,43 @@ interface PreparedBookEvaluation {
   roundedToZero: string[];
 }
 
+function objectiveTier(candidate: BookSearchEvaluation): number {
+  if (candidate.maxDrawdownPct! > 0) return 1;
+  return candidate.returnPct > 0 ? 2 : 0;
+}
+
+function objectiveScore(candidate: BookSearchEvaluation, ratio: boolean): number {
+  if (!ratio || objectiveTier(candidate) !== 1) return candidate.returnPct;
+  const value = candidate.returnPct / candidate.maxDrawdownPct!;
+  if (!Number.isFinite(value))
+    throw new RangeError("Invalid drawdown search: non-finite objective ratio");
+  return value;
+}
+
+function compareObjective(
+  a: BookSearchEvaluation,
+  b: BookSearchEvaluation,
+  ratio: boolean,
+): number {
+  const tier = ratio ? objectiveTier(a) - objectiveTier(b) : 0;
+  if (tier) return tier;
+  const left = objectiveScore(a, ratio);
+  const right = objectiveScore(b, ratio);
+  return left > right ? 1 : left < right ? -1 : 0;
+}
+
 /**
  * Bounded best-observed coordinate search; never a certified global optimum.
  * memberCapPolicies holds selected maxContractsPerTrade caps fixed across all
  * searches while sizing still follows weight; zero weight still removes a member.
  * Omitted policies retain scaled caps. Null caps remain uncapped.
+ * objective defaults to returnPct. returnOverDrawdown divides closed return by
+ * marked drawdown when marks are supplied, otherwise closed drawdown. Positive
+ * return with nonpositive drawdown ranks first by return (undefined ratio);
+ * positive drawdown ranks next by signed ratio; nonpositive return with
+ * nonpositive drawdown ranks last by return. Exact ties retain the first observed
+ * candidate. Non-finite ratios throw rather than silently win. Ratio results add
+ * objectiveValue (null for undefined ratios/refusal) and objectiveTier.
  * Optional progress is emitted after each new evaluation (including auxiliary
  * searches). Calling event.checkpoint() captures a detached JSON checkpoint on
  * demand; the event itself contains no journal copy. A throwing observer aborts
@@ -178,10 +219,14 @@ interface PreparedBookEvaluation {
  * and resume; changing policy without changing its ID reuses old verdicts.
  * Checkpoint-capable calls with feasible require feasibleId before any evaluation.
  */
-export function searchBookAtDrawdown(
-  input: DrawdownBudgetSearchInput,
+export function searchBookAtDrawdown<O extends SearchObjective = "returnPct">(
+  input: DrawdownBudgetSearchInput<O>,
   options?: BookSearchOptions,
-): DrawdownBudgetSearchResult {
+): DrawdownBudgetSearchResult<O>;
+export function searchBookAtDrawdown(
+  input: DrawdownBudgetSearchInput<SearchObjective>,
+  options?: BookSearchOptions,
+): DrawdownBudgetSearchResult<SearchObjective> {
   if (!options?.onProgress && !options?.checkpoint && !options?.resumeFrom) return runSearch(input);
   if (input.feasible && !options.feasibleId)
     throw new RangeError("search_checkpoint_constraint_identity: feasibleId is required");
@@ -211,11 +256,14 @@ export function searchBookAtDrawdown(
 }
 
 function runSearch(
-  input: DrawdownBudgetSearchInput,
+  input: DrawdownBudgetSearchInput<SearchObjective>,
   execution?: SearchExecution,
   scope = "root",
-): DrawdownBudgetSearchResult {
+): DrawdownBudgetSearchResult<SearchObjective> {
   validateSearch(input);
+  const ratio = input.objective === "returnOverDrawdown";
+  const better = (a: BookSearchEvaluation, b: BookSearchEvaluation) =>
+    compareObjective(a, b, ratio) > 0;
   const ids = input.replay.simultaneousOrder;
   const limit = input.targetDrawdownPct - input.calibrationMarginPct;
   const evaluations: BookSearchEvaluation[] = [];
@@ -356,7 +404,7 @@ function runSearch(
       if (
         execution.onProgress &&
         candidate.feasible &&
-        (!progressBest || candidate.returnPct > progressBest.returnPct)
+        (!progressBest || better(candidate, progressBest))
       )
         progressBest = candidate;
       if (!saved) {
@@ -430,7 +478,7 @@ function runSearch(
                 coordinateBudget,
               );
               if (!trial) break;
-              if (trial.feasible && (!current.feasible || trial.returnPct > current.returnPct)) {
+              if (trial.feasible && (!current.feasible || better(trial, current))) {
                 current = trial;
                 changed = true;
               }
@@ -443,9 +491,7 @@ function runSearch(
   }
   const winner = evaluations.reduce<BookSearchEvaluation | null>(
     (winner, candidate) =>
-      candidate.feasible && (!winner || candidate.returnPct > winner.returnPct)
-        ? candidate
-        : winner,
+      candidate.feasible && (!winner || better(candidate, winner)) ? candidate : winner,
     null,
   );
   let robust: BookSearchEvaluation | null = null;
@@ -460,13 +506,13 @@ function runSearch(
       );
       robustBudgetExhausted ||= candidate === null;
       shrinkageOutperformedBest ||=
-        candidate !== null && candidate.feasible && candidate.returnPct > base.returnPct;
+        candidate !== null && candidate.feasible && better(candidate, base);
     }
     for (const candidate of evaluations)
       if (
         candidate.feasible &&
         candidate.maxDrawdownPct! <= input.robust.maxDrawdownPct &&
-        (!robust || candidate.returnPct > robust.returnPct)
+        (!robust || better(candidate, robust))
       )
         robust = candidate;
   }
@@ -474,8 +520,10 @@ function runSearch(
     ? evaluations.filter(
         (e) =>
           e.feasible &&
-          e.returnPct >=
-            winner.returnPct - Math.abs(winner.returnPct) * input.nearOptimalRelativeTolerance,
+          (!ratio || objectiveTier(e) === objectiveTier(winner)) &&
+          objectiveScore(e, ratio) >=
+            objectiveScore(winner, ratio) -
+              Math.abs(objectiveScore(winner, ratio)) * input.nearOptimalRelativeTolerance,
       )
     : [];
   const weightRanges = Object.fromEntries(
@@ -496,7 +544,7 @@ function runSearch(
         : !robust
           ? "no_robust_candidate"
           : null;
-  const dropOne: DrawdownBudgetSearchResult["dropOne"] = [];
+  const dropOne: DrawdownBudgetSearchResult<SearchObjective>["dropOne"] = [];
   if (winner && input.dropOne && input.calibrationUsable) {
     for (const id of ids) {
       const search = runSearch(
@@ -528,7 +576,7 @@ function runSearch(
       0,
     );
   if (feasibilityRejections) {
-    const merge = (search: DrawdownBudgetSearchResult) => {
+    const merge = (search: DrawdownBudgetSearchResult<SearchObjective>) => {
       const rejected = search.feasibilityRejections;
       if (!rejected) return;
       feasibilityRejections.count += rejected.count;
@@ -540,9 +588,9 @@ function runSearch(
     for (const panel of stability.panels)
       for (const replicate of panel.replicates) if (replicate.search) merge(replicate.search);
   }
-  const declarations = input.feasible ? { ...input } : input;
-  if (input.feasible) delete declarations.feasible;
-  const result: DrawdownBudgetSearchResult = {
+  const { feasible: _feasible, ...declaredInput } = input;
+  const declarations = { ...declaredInput, objective: input.objective ?? "returnPct" } as const;
+  const result: DrawdownBudgetSearchResult<SearchObjective> = {
     status: reason ? "refused" : "ok",
     reason,
     drawdownBasis: input.replay.marks ? "offline_marked_equity" : "offline_closed_equity",
@@ -582,16 +630,29 @@ function runSearch(
     ],
   };
   if (feasibilityRejections) result.feasibilityRejections = feasibilityRejections;
+  if (ratio) {
+    result.objectiveValue =
+      result.best && objectiveTier(result.best) === 1 ? objectiveScore(result.best, true) : null;
+    result.objectiveTier = result.best
+      ? objectiveTier(result.best) === 2
+        ? "zeroDrawdown"
+        : objectiveTier(result.best) === 1
+          ? "ratio"
+          : "nonPositiveReturn"
+      : null;
+  }
   return result;
 }
 
-function validateSearch(input: DrawdownBudgetSearchInput): void {
+function validateSearch(input: DrawdownBudgetSearchInput<SearchObjective>): void {
   const fail = (name: string): never => {
     throw new RangeError(`Invalid drawdown search: ${name}`);
   };
   const ids = input.replay.simultaneousOrder;
   if (
-    input.objective !== "returnPct" ||
+    (input.objective !== undefined &&
+      input.objective !== "returnPct" &&
+      input.objective !== "returnOverDrawdown") ||
     typeof input.calibrationUsable !== "boolean" ||
     typeof input.dropOne !== "boolean"
   )
@@ -678,10 +739,10 @@ function validateSearch(input: DrawdownBudgetSearchInput): void {
 }
 
 function bootstrapStability(
-  input: DrawdownBudgetSearchInput,
+  input: DrawdownBudgetSearchInput<SearchObjective>,
   execution?: SearchExecution,
-): BookSearchStability {
-  const result: BookSearchStability = {
+): BookSearchStability<SearchObjective> {
+  const result: BookSearchStability<SearchObjective> = {
     status: "disabled",
     reason: null,
     basis: "entry_day_cohorts_with_close_offsets",
@@ -722,7 +783,7 @@ function bootstrapStability(
     input.stability.meanBlockDays,
     ...input.stability.sensitivityBlockDays,
   ]) {
-    const replicates: BookSearchStability["panels"][number]["replicates"] = [];
+    const replicates: BookSearchStability<SearchObjective>["panels"][number]["replicates"] = [];
     for (let replicate = 0; replicate < input.stability.replicates; replicate++) {
       const sourceIndices = resampleStationaryBlocks(
         indices,
