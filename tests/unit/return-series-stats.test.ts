@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@jest/globals";
 import {
   cvarFromReturns,
+  cvarFromReturnsAtConfidence,
   maxDrawdownFromReturns,
   sharpeRatioFromReturns,
   sortinoRatioFromReturns,
@@ -47,6 +48,77 @@ describe("return-series statistics public API", () => {
     // Position is (5 - 1) * 0.05 = 0.2, so the cutoff interpolates to -0.18.
     // Only -0.2 is at or below the cutoff; its mean is -0.2.
     expect(cvarFromReturns(returns)).toBe(-0.2);
+  });
+
+  it("ignores callback extras so point-free mapping keeps the 95% result", () => {
+    const series = [datedReturns([-0.2, -0.1, 0, 0.1, 0.2]), datedReturns([0.3, -0.2, 0.1, -0.2])];
+    // Array.prototype.map passes (value, index, array); index 0 must not become a confidence.
+    expect(series.map(cvarFromReturns)).toEqual([-0.2, -0.2]);
+  });
+
+  it("selects the configured discrete tail without changing signed decimal units", () => {
+    const returns = datedReturns(Array.from({ length: 102 }, (_, index) => (index - 50) / 100));
+    // At 90%, position 10.1 cuts between -0.40 and -0.39: eleven observations,
+    // -0.50 through -0.40, have an unweighted mean of -0.45.
+    expect(cvarFromReturnsAtConfidence(returns, 0.9)).toBeCloseTo(-0.45, 14);
+    // At 99%, the cutoff includes -0.50 and -0.49, whose mean is -0.495.
+    expect(cvarFromReturnsAtConfidence(returns, 0.99)).toBe(-0.495);
+    // Positive returns retain their sign, and ties at the cutoff are all included.
+    expect(cvarFromReturnsAtConfidence(datedReturns([0.01, 0.02, 0.02, 0.1]), 0.5)).toBe(0.05 / 3);
+  });
+
+  it.each([
+    // (11 - 1) * (1 - 0.9) is 0.9999999999999998; the cutoff is the second order statistic.
+    {
+      confidence: 0.9,
+      values: Array.from({ length: 11 }, (_, index) => index / 100),
+      expected: 0.005,
+    },
+    // (6 - 1) * (1 - 0.8) is 0.9999999999999998 as well.
+    { confidence: 0.8, values: [0, 0.01, 0.02, 0.03, 0.04, 0.05], expected: 0.005 },
+    // (2001 - 1) * (1 - 0.9995) is 0.9999999999998899: cancellation in 1 - confidence
+    // dominates, so the tolerance must scale with the observation count.
+    {
+      confidence: 0.9995,
+      values: Array.from({ length: 2001 }, (_, index) => index / 1000),
+      expected: 0.0005,
+    },
+  ])(
+    "keeps the order statistic at an integral $confidence cutoff despite rounding",
+    ({ confidence, values, expected }) => {
+      expect(cvarFromReturnsAtConfidence(datedReturns(values), confidence)).toBe(expected);
+    },
+  );
+
+  it.each([
+    { values: [], expected: undefined },
+    { values: [-0.25], expected: -0.25 },
+    { values: [0.2, -0.1], expected: -0.1 },
+    { values: [0.1, 0.1, 0.2], expected: 0.1 },
+    { values: [0.3, -0.2, 0.1, -0.2], expected: -0.2 },
+    { values: Array.from({ length: 21 }, (_, index) => index / 100), expected: 0.005 },
+    { values: [-1e308, -1e307, ...Array<number>(19).fill(1.79e308)], expected: -5.5e307 },
+  ])("preserves the exact legacy default for $values", ({ values, expected }) => {
+    // Frozen outputs from the original literal-0.05 estimator, not another estimator.
+    expect(cvarFromReturns(datedReturns(values))).toBe(expected);
+    expect(cvarFromReturnsAtConfidence(datedReturns(values), 0.95)).toBe(expected);
+  });
+
+  it.each([0, 1, -0.1, 1.1, NaN, Infinity, -Infinity])(
+    "throws a value-naming RangeError for invalid confidence %s even with no observations",
+    (confidence) => {
+      for (const returns of [[], datedReturns([-0.1, 0.1])]) {
+        expect(() => cvarFromReturnsAtConfidence(returns, confidence)).toThrow(RangeError);
+        expect(() => cvarFromReturnsAtConfidence(returns, confidence)).toThrow(
+          `received ${confidence}`,
+        );
+      }
+    },
+  );
+
+  it("keeps empty and single-observation contracts at valid custom confidence levels", () => {
+    expect(cvarFromReturnsAtConfidence([], 0.9)).toBeUndefined();
+    expect(cvarFromReturnsAtConfidence(datedReturns([-0.25]), 0.99)).toBe(-0.25);
   });
 
   it("calculates UPI using compounded annualized return and percent drawdowns", () => {

@@ -91,16 +91,48 @@ export function maxDrawdownFromReturns(
 
 /**
  * Calculate CVaR at 95% in the same decimal unit and sign as the input returns.
- * The 5th-percentile cutoff uses linear interpolation between order statistics.
- * The tail mean includes the discrete observations at or below that cutoff without fractional weighting.
+ * Takes exactly one argument, so point-free callbacks (`series.map(cvarFromReturns)`) keep working;
+ * use cvarFromReturnsAtConfidence for another level.
  */
 export function cvarFromReturns(
   returns: ReadonlyArray<{ date: Date; return: number }>,
 ): number | undefined {
+  return cvarFromReturnsAtConfidence(returns, 0.95);
+}
+
+/**
+ * Calculate CVaR at a confidence level in the same decimal unit and sign as the input returns.
+ * Confidence must be finite and strictly between 0 and 1.
+ * The (1 - confidence) percentile cutoff uses linear interpolation between order statistics.
+ * The tail mean includes the discrete observations at or below that cutoff without fractional weighting.
+ * Returns undefined for an empty series; throws RangeError for invalid confidence, even on empty input.
+ */
+export function cvarFromReturnsAtConfidence(
+  returns: ReadonlyArray<{ date: Date; return: number }>,
+  confidence: number,
+): number | undefined {
+  if (!Number.isFinite(confidence) || confidence <= 0 || confidence >= 1) {
+    throw new RangeError(
+      `Confidence must be finite and strictly between 0 and 1; received ${confidence}`,
+    );
+  }
+
   if (returns.length === 0) return undefined;
 
   const sortedReturns = returns.map((observation) => observation.return).sort((a, b) => a - b);
-  const position = (sortedReturns.length - 1) * 0.05;
+  // Preserve legacy cutoff arithmetic exactly: 1 - 0.95 !== 0.05 in floating point.
+  const tailProbability = confidence === 0.95 ? 0.05 : 1 - confidence;
+  const rawPosition = (sortedReturns.length - 1) * tailProbability;
+  // 1 - confidence can land an integral position just below its order statistic
+  // ((11 - 1) * (1 - 0.9) is 0.9999999999999998); snap rounding error, not real fractions.
+  // The absolute error of 1 - confidence is about one ulp near 1, so the position error
+  // scales with the observation count, not with the position itself.
+  // The literal 0.05 never undershoots, so the 95% result is unchanged.
+  const nearest = Math.round(rawPosition);
+  const position =
+    Math.abs(rawPosition - nearest) <= 8 * Number.EPSILON * Math.max(1, sortedReturns.length - 1)
+      ? nearest
+      : rawPosition;
   const lowerIndex = Math.floor(position);
   const upperIndex = Math.ceil(position);
   const fraction = position - lowerIndex;
