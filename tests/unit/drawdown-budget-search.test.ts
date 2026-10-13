@@ -1,6 +1,256 @@
 import { createHash } from "node:crypto";
 import { searchBookAtDrawdown } from "@tradeblocks/lib";
-import type { BookReplayResult, DrawdownBudgetSearchInput } from "@tradeblocks/lib";
+import type {
+  BookReplayResult,
+  BookSearchCheckpoint,
+  DrawdownBudgetSearchInput,
+} from "@tradeblocks/lib";
+
+it("observes committed progress without changing search results", () => {
+  const value = input();
+  const baseline = searchBookAtDrawdown(value);
+  const counts: number[] = [];
+  const bestReturns: Array<number | null> = [];
+  const observed = searchBookAtDrawdown(value, {
+    onProgress: (event) => {
+      counts.push(event.evaluationsDone);
+      bestReturns.push(event.best?.returnPct ?? null);
+      expect(event.checkpoint().evaluations).toHaveLength(event.evaluationsDone);
+    },
+  });
+  delete observed.checkpoint;
+  expect(JSON.stringify(observed)).toBe(JSON.stringify(baseline));
+  expect(counts).toEqual([1, 2, 3, 4]);
+  expect(bestReturns).toEqual([null, null, 20, 20]);
+  expect(baseline.best).toMatchObject({ weights: { a: 0.5 }, returnPct: 20 });
+});
+
+it("aborts even a missing-mark-shaped observer error during auxiliary search", () => {
+  const value = input();
+  value.stability.replicates = 1;
+  expect(() =>
+    searchBookAtDrawdown(value, {
+      onProgress: (event) => {
+        if (event.scope.startsWith("stability/"))
+          throw new RangeError("missing_mark_coverage: observer failure");
+      },
+    }),
+  ).toThrow(/search_progress_callback/);
+});
+
+it("resumes JSON checkpoints at every evaluation across robust, drop-one and seeded panels", () => {
+  const value = cappedInput();
+  value.memberCapPolicies = { a: "fixed" };
+  value.dropOne = true;
+  value.stability.replicates = 2;
+  value.stability.sensitivityBlockDays = [1, 3];
+  let calls = 0;
+  value.feasible = (replay) => {
+    calls++;
+    return replay.census.executedGroups > 0 ? true : { ok: false, reason: "empty" };
+  };
+  const baseline = searchBookAtDrawdown(value);
+  const checkpoints: BookSearchCheckpoint[] = [];
+  const scopes = new Set<string>();
+  const phases = new Set<string>();
+  const stop = new Error("stop after save");
+  for (let interruption = 1; interruption <= baseline.totalEvaluations; interruption++) {
+    calls = 0;
+    let saved: BookSearchCheckpoint | undefined;
+    expect(() =>
+      searchBookAtDrawdown(value, {
+        feasibleId: "nonempty-v1",
+        onProgress: (event) => {
+          scopes.add(event.scope);
+          phases.add(event.phase);
+          if (event.evaluationsDone === interruption) {
+            saved = JSON.parse(JSON.stringify(event.checkpoint()));
+            throw stop;
+          }
+        },
+      }),
+    ).toThrow(/search_progress_callback/);
+    expect(calls).toBe(interruption);
+    checkpoints.push(saved!);
+    calls = 0;
+    const resumed = searchBookAtDrawdown(value, {
+      resumeFrom: saved,
+      feasibleId: "nonempty-v1",
+    });
+    expect(calls).toBe(baseline.totalEvaluations - interruption);
+    delete resumed.checkpoint;
+    expect(JSON.stringify(resumed)).toBe(JSON.stringify(baseline));
+  }
+  expect(phases).toEqual(new Set(["coordinate", "robust"]));
+  expect(scopes).toContain("dropOne/a");
+  expect(scopes).toContain("stability/0/1");
+  expect(scopes).toContain("stability/2/1");
+  calls = 0;
+  const completed = searchBookAtDrawdown(value, { checkpoint: true, feasibleId: "nonempty-v1" });
+  expect(calls).toBe(baseline.totalEvaluations);
+  calls = 0;
+  const repeated = searchBookAtDrawdown(value, {
+    resumeFrom: JSON.parse(JSON.stringify(completed.checkpoint)),
+    feasibleId: "nonempty-v1",
+    onProgress: () => {
+      throw new Error("completed evaluations must not emit again");
+    },
+  });
+  expect(calls).toBe(0);
+  expect(JSON.stringify(repeated)).toBe(JSON.stringify(completed));
+  expect(checkpoints[0].evaluations).toHaveLength(1);
+});
+
+it("refuses changes anywhere in the economic request and in constraint identity", () => {
+  const value = input();
+  value.feasible = () => true;
+  const checkpoint = searchBookAtDrawdown(value, {
+    checkpoint: true,
+    feasibleId: "policy-v1",
+  }).checkpoint!;
+  // Reordering input trades must invalidate identity even if replay sorts them.
+  const changes: Array<(request: DrawdownBudgetSearchInput) => void> = [
+    (request) => {
+      request.replay.trades[0].netPlPerContract--;
+    },
+    (request) => {
+      request.replay.trades.reverse();
+    },
+    (request) => {
+      request.replay.members.a.maxOpenTrades = 2;
+    },
+    (request) => {
+      request.weightBounds.a.max = 2;
+    },
+    (request) => {
+      request.initialWeights[0].a = 0.5;
+    },
+    (request) => {
+      request.steps = [0.25];
+    },
+    (request) => {
+      request.weightPrecision = 3;
+    },
+    (request) => {
+      request.allocationPrecision = 3;
+    },
+    (request) => {
+      request.memberCapPolicies = { a: "fixed" };
+    },
+    (request) => {
+      request.maxEvaluations++;
+    },
+    (request) => {
+      request.stability.seed++;
+    },
+    (request) => {
+      request.robust.maxDrawdownPct++;
+    },
+    (request) => {
+      Object.assign(request, { futureEconomicField: { amount: 1 } });
+    },
+  ];
+  for (const change of changes) {
+    const changed = input();
+    changed.feasible = value.feasible;
+    change(changed);
+    expect(() =>
+      searchBookAtDrawdown(changed, {
+        resumeFrom: checkpoint,
+        feasibleId: "policy-v1",
+      }),
+    ).toThrow(/search_checkpoint_identity_mismatch/);
+  }
+  expect(() =>
+    searchBookAtDrawdown(value, {
+      resumeFrom: checkpoint,
+      feasibleId: "policy-v2",
+    }),
+  ).toThrow(/search_checkpoint_identity_mismatch/);
+  expect(() => searchBookAtDrawdown(value, { resumeFrom: checkpoint })).toThrow(
+    /search_checkpoint_constraint_identity/,
+  );
+  const reordered = { ...value, weightBounds: { a: { max: 1, min: 0 } } };
+  expect(
+    searchBookAtDrawdown(reordered, { resumeFrom: checkpoint, feasibleId: "policy-v1" }).best,
+  ).toMatchObject({ weights: { a: 0.5 }, returnPct: 20 });
+});
+
+it.each(["checkpoint", "progress"] as const)(
+  "refuses %s capture without a feasibility ID before evaluating or observing",
+  (mode) => {
+    const value = input();
+    let evaluations = 0;
+    let events = 0;
+    value.feasible = () => {
+      evaluations++;
+      return true;
+    };
+    const options =
+      mode === "checkpoint"
+        ? { checkpoint: true }
+        : {
+            onProgress: () => {
+              events++;
+            },
+          };
+    expect(() => searchBookAtDrawdown(value, options)).toThrow(
+      /search_checkpoint_constraint_identity/,
+    );
+    expect(evaluations).toBe(0);
+    expect(events).toBe(0);
+    expect(searchBookAtDrawdown(value).best).toMatchObject({ weights: { a: 0.5 }, returnPct: 20 });
+  },
+);
+
+it("binds feasibility presence in checkpoint identity in both directions", () => {
+  const withoutPolicy = input();
+  const withPolicy = { ...withoutPolicy, feasible: () => true };
+  const options = { checkpoint: true, feasibleId: "policy-v1" };
+  const withPolicyCheckpoint = searchBookAtDrawdown(withPolicy, options).checkpoint!;
+  const withoutPolicyCheckpoint = searchBookAtDrawdown(withoutPolicy, options).checkpoint!;
+  expect(() =>
+    searchBookAtDrawdown(withoutPolicy, {
+      resumeFrom: withPolicyCheckpoint,
+      feasibleId: "policy-v1",
+    }),
+  ).toThrow(/search_checkpoint_identity_mismatch/);
+  expect(() =>
+    searchBookAtDrawdown(withPolicy, {
+      resumeFrom: withoutPolicyCheckpoint,
+      feasibleId: "policy-v1",
+    }),
+  ).toThrow(/search_checkpoint_identity_mismatch/);
+});
+
+it("isolates progress object mutations from live search and later checkpoints", () => {
+  const value = input();
+  const baseline = searchBookAtDrawdown(value);
+  const result = searchBookAtDrawdown(value, {
+    onProgress: (event) => {
+      event.checkpoint().evaluations[0].evaluation.returnPct = 9999;
+      if (event.best) event.best.weights.a = 9999;
+    },
+  });
+  expect(result.checkpoint!.evaluations[0].evaluation.returnPct).toBe(0);
+  delete result.checkpoint;
+  expect(JSON.stringify(result)).toBe(JSON.stringify(baseline));
+});
+
+it("captures retained progress events lazily at their original committed prefix", () => {
+  const snapshots: Array<() => BookSearchCheckpoint> = [];
+  const result = searchBookAtDrawdown(input(), {
+    onProgress: (event) => snapshots.push(event.checkpoint),
+  });
+  expect(snapshots).toHaveLength(4);
+  expect(snapshots.map((capture) => capture().evaluations.length)).toEqual([1, 2, 3, 4]);
+  const first = snapshots[0]();
+  first.evaluations[0].evaluation.returnPct = 9999;
+  expect(snapshots[0]().evaluations[0].evaluation.returnPct).toBe(0);
+  expect(result.checkpoint!.evaluations[0].evaluation.returnPct).toBe(0);
+  expect(snapshots[3]()).toEqual(result.checkpoint);
+  expect(JSON.parse(JSON.stringify(result.checkpoint))).toEqual(result.checkpoint);
+});
 
 function input(): DrawdownBudgetSearchInput {
   return {
@@ -507,6 +757,22 @@ it("counts bootstrap replicates that activate uncovered positions as unavailable
       .every((r) => r.reason === "missing_mark_coverage" && r.search === null),
   ).toBe(true);
   expect(panel.feasibleFraction).toBe(0.5);
+  const captured = searchBookAtDrawdown(value, { checkpoint: true });
+  expect(captured.checkpoint!.unavailableEvaluations).toHaveLength(2);
+  expect(
+    captured.checkpoint!.unavailableEvaluations.every((failure) =>
+      failure.message.startsWith("missing_mark_coverage:"),
+    ),
+  ).toBe(true);
+  const resumed = searchBookAtDrawdown(value, {
+    resumeFrom: JSON.parse(JSON.stringify(captured.checkpoint)),
+    onProgress: () => {
+      throw new Error("completed search must reuse its outcomes");
+    },
+  });
+  expect(JSON.stringify(resumed)).toBe(JSON.stringify(captured));
+  delete resumed.checkpoint;
+  expect(JSON.stringify(resumed)).toBe(JSON.stringify(result));
   value.replay.trades[0].buyingPowerPerContract = 0;
   expect(() => searchBookAtDrawdown(value)).toThrow(/unit economics/);
 });
