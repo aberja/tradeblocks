@@ -49,6 +49,15 @@ function getMetricPl(trade: Trade): number {
   return getNetPl(trade);
 }
 
+function toMetricTrades(trades: Trade[]): Trade[] {
+  if (trades.every((trade) => trade.plBasis === PlBasis.NetIncludesFees)) return trades;
+  return trades.map((trade) => ({
+    ...trade,
+    pl: getMetricPl(trade),
+    plBasis: PlBasis.NetIncludesFees,
+  }));
+}
+
 function hasDailyLog(entries?: DailyLogEntry[]): entries is DailyLogEntry[] {
   return !!entries?.length;
 }
@@ -158,11 +167,7 @@ export class PortfolioStatsCalculator {
 
     // Derived metrics always use net-after-fee P/L. The original reported P/L
     // remains available separately as totalPl.
-    const metricTrades = validTrades.map((trade) => ({
-      ...trade,
-      pl: getMetricPl(trade),
-      plBasis: PlBasis.NetIncludesFees,
-    }));
+    const metricTrades = toMetricTrades(validTrades);
 
     // Basic statistics
     const totalTrades = validTrades.length;
@@ -759,18 +764,25 @@ export class PortfolioStatsCalculator {
   }
 
   /**
-   * Calculate daily returns WITH associated dates for date-based risk-free rate calculations.
-   * Returns an array of {date, return} pairs where:
-   * - date: The trading day's date (for looking up that day's Treasury rate)
-   * - return: The portfolio return for that day as a decimal (e.g., 0.01 = 1%)
+   * Return the dated decimal series used by Sharpe and Sortino for valid trades.
+   * With daily logs, returns use daily P/L divided by prior net liquidity.
+   * Otherwise, basis-aware net trade P/L is grouped by close date (opening-date
+   * fallback), divided by reconstructed prior equity, and zero-filled on business
+   * days between this arm's first and last close dates. Weekend exits are retained.
+   * Nonpositive prior equity produces no observation. Empty trades return [].
+   * Uses the same net mapping as calculatePortfolioStats; already-net P/L is not
+   * charged fees again. Caller trades are not mutated. Rebuild equity first when
+   * analyzing a resized/removed arm; rebuildEquityCurve changes funds, not P/L.
    */
-  private calculateDailyReturnsWithDates(
+  calculateDailyReturnsWithDates(
     trades: Trade[],
     dailyLogEntries?: DailyLogEntry[],
   ): DailyReturnWithDate[] {
     if (dailyLogEntries && dailyLogEntries.length > 0) {
       return dailyLogReturns(dailyLogEntries);
     }
+
+    trades = toMetricTrades(trades);
 
     // Calculate from trade data
     const sortedTrades = [...trades].sort((a, b) => {
