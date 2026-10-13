@@ -1,4 +1,7 @@
 import { jest } from "@jest/globals";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 
 /**
  * Unit tests for MassiveProvider — Massive.com market data adapter.
@@ -1080,6 +1083,400 @@ describe("MassiveProvider.fetchQuotes — tier-aware endpoint selection", () => 
     delete process.env.MASSIVE_API_KEY;
     delete process.env.MASSIVE_DATA_TIER;
     jest.restoreAllMocks();
+  });
+
+  it("reports an HTTP failure instead of empty success", async () => {
+    process.env.MASSIVE_DATA_TIER = "quotes";
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(outcomes).toEqual([
+      {
+        date: "2025-01-07",
+        outcome: "error",
+        httpStatus: 403,
+        errorClass: "http_status",
+        pagesFetched: 0,
+      },
+    ]);
+  });
+
+  it.each(["quotes", "ohlc"])("discards page-one rows when page two fails on %s", async (tier) => {
+    process.env.MASSIVE_DATA_TIER = tier;
+    const row =
+      tier === "quotes"
+        ? {
+            bid_price: 12.5,
+            ask_price: 13.5,
+            sip_timestamp: 1736260200000 * 1_000_000,
+            bid_size: 1,
+            ask_size: 1,
+            sequence_number: 1,
+          }
+        : { ...VALID_BAR, t: 1736260200000 };
+    fetchSpy
+      .mockResolvedValueOnce(
+        mockResponse({
+          status: "OK",
+          request_id: "p1",
+          ticker: "O:SPX250107C05000000",
+          queryCount: 1,
+          next_url: "https://api.massive.com/page2",
+          results: [row],
+        }),
+      )
+      .mockResolvedValueOnce(new Response("", { status: 503 }));
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(outcomes).toEqual([
+      {
+        date: "2025-01-07",
+        outcome: "error",
+        httpStatus: 503,
+        errorClass: "http_status",
+        pagesFetched: 1,
+      },
+    ]);
+  });
+
+  it("reports synth_close HTTP errors through the same observer", async () => {
+    process.env.MASSIVE_DATA_TIER = "ohlc";
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(outcomes).toEqual([
+      {
+        date: "2025-01-07",
+        outcome: "error",
+        httpStatus: 403,
+        errorClass: "http_status",
+        pagesFetched: 0,
+      },
+    ]);
+  });
+
+  it("reports exhausted existing aggregate retries as HTTP 429", async () => {
+    process.env.MASSIVE_DATA_TIER = "ohlc";
+    fetchSpy.mockImplementation(async () => mockResponse({}, 429, { "Retry-After": "0" }));
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect(outcomes).toEqual([
+      {
+        date: "2025-01-07",
+        outcome: "error",
+        httpStatus: 429,
+        errorClass: "http_status",
+        pagesFetched: 0,
+      },
+    ]);
+  });
+
+  it("declares a still-paginated response at the NBBO page cap an error", async () => {
+    process.env.MASSIVE_DATA_TIER = "quotes";
+    fetchSpy.mockImplementation(async () =>
+      mockResponse({
+        status: "OK",
+        request_id: "repeat",
+        results: [],
+        next_url: "https://api.massive.com/more",
+      }),
+    );
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(50);
+    expect(outcomes).toEqual([
+      { date: "2025-01-07", outcome: "error", errorClass: "pagination_limit", pagesFetched: 50 },
+    ]);
+  });
+
+  it.each(["ERROR", "DELAYED"])(
+    "classifies a valid HTTP-200 quote payload with status %s",
+    async (status) => {
+      process.env.MASSIVE_DATA_TIER = "quotes";
+      fetchSpy.mockResolvedValueOnce(
+        mockResponse({
+          status,
+          request_id: "semantic-status",
+          results: [
+            {
+              bid_price: 12,
+              ask_price: 13,
+              bid_size: 1,
+              ask_size: 1,
+              sequence_number: 1,
+              sip_timestamp: 1736260200000 * 1_000_000,
+            },
+          ],
+        }),
+      );
+      const outcomes: unknown[] = [];
+      const quotes = await new MassiveProvider().fetchQuotes(
+        "SPX250107C05000000",
+        "2025-01-07",
+        "2025-01-07",
+        (outcome) => outcomes.push(outcome),
+      );
+      if (status === "ERROR") {
+        expect(quotes.size).toBe(0);
+        expect(outcomes).toEqual([
+          {
+            date: "2025-01-07",
+            outcome: "error",
+            httpStatus: 200,
+            errorClass: "invalid_payload",
+            pagesFetched: 0,
+          },
+        ]);
+      } else {
+        expect([...quotes]).toEqual([["2025-01-07 09:30", { bid: 12, ask: 13, source: "nbbo" }]]);
+        expect(outcomes).toEqual([{ date: "2025-01-07", outcome: "ok", pagesFetched: 1 }]);
+      }
+    },
+  );
+
+  it.each(["success", "http_error", "page_two_error"])(
+    "keeps one synth_close range fetch and derives each date receipt on %s",
+    async (scenario) => {
+      process.env.MASSIVE_DATA_TIER = "ohlc";
+      const base = {
+        status: "OK",
+        request_id: "range",
+        ticker: "O:SPX250107C05000000",
+        queryCount: 1,
+      };
+      if (scenario === "http_error") {
+        fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+      } else {
+        fetchSpy.mockResolvedValueOnce(
+          mockResponse({
+            ...base,
+            next_url: "https://api.massive.com/page2",
+            results: [{ ...VALID_BAR, t: 1736260200000 }],
+          }),
+        );
+        fetchSpy.mockResolvedValueOnce(
+          scenario === "page_two_error"
+            ? new Response("", { status: 503 })
+            : mockResponse({ ...base, results: [{ ...VALID_BAR, t: 1736433000000 }] }),
+        );
+      }
+      const outcomes: unknown[] = [];
+      const quotes = await new MassiveProvider().fetchQuotes(
+        "SPX250107C05000000",
+        "2025-01-07",
+        "2025-01-09",
+        (outcome) => outcomes.push(outcome),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(scenario === "http_error" ? 1 : 2);
+      expect(fetchSpy.mock.calls[0][0]).toContain("/range/1/minute/2025-01-07/2025-01-09");
+      if (scenario === "success") {
+        expect([...quotes]).toEqual([
+          ["2025-01-07 09:30", { bid: 101, ask: 101, source: "synth_close" }],
+          ["2025-01-09 09:30", { bid: 101, ask: 101, source: "synth_close" }],
+        ]);
+        expect(outcomes).toEqual([
+          { date: "2025-01-07", outcome: "ok", pagesFetched: 2 },
+          { date: "2025-01-08", outcome: "empty", pagesFetched: 2 },
+          { date: "2025-01-09", outcome: "ok", pagesFetched: 2 },
+        ]);
+      } else {
+        expect(quotes.size).toBe(0);
+        expect(outcomes).toEqual(
+          ["2025-01-07", "2025-01-08", "2025-01-09"].map((date) => ({
+            date,
+            outcome: "error",
+            httpStatus: scenario === "http_error" ? 403 : 503,
+            errorClass: "http_status",
+            pagesFetched: scenario === "http_error" ? 0 : 1,
+          })),
+        );
+      }
+    },
+  );
+
+  it.each(["quotes", "ohlc"])(
+    "reports invalid payload, exception and timeout on %s",
+    async (tier) => {
+      process.env.MASSIVE_DATA_TIER = tier;
+      const cases = [
+        {
+          response: mockResponse({ results: [{ broken: true }] }),
+          errorClass: "invalid_payload",
+          httpStatus: 200,
+        },
+        { error: new Error("network unavailable"), errorClass: "exception" },
+        { error: new DOMException("deadline", "TimeoutError"), errorClass: "timeout" },
+        { response: new Response("not json"), errorClass: "invalid_payload", httpStatus: 200 },
+      ];
+      for (const scenario of cases) {
+        fetchSpy.mockReset();
+        if (scenario.error) fetchSpy.mockRejectedValueOnce(scenario.error);
+        else fetchSpy.mockResolvedValueOnce(scenario.response!);
+        const outcomes: unknown[] = [];
+        const quotes = await new MassiveProvider().fetchQuotes(
+          "SPX250107C05000000",
+          "2025-01-07",
+          "2025-01-07",
+          (outcome) => outcomes.push(outcome),
+        );
+        expect(quotes.size).toBe(0);
+        expect(outcomes).toEqual([
+          {
+            date: "2025-01-07",
+            outcome: "error",
+            pagesFetched: 0,
+            errorClass: scenario.errorClass,
+            ...(scenario.httpStatus !== undefined ? { httpStatus: scenario.httpStatus } : {}),
+          },
+        ]);
+      }
+    },
+  );
+
+  it.each(["quotes", "ohlc"])("reports genuine empty success on %s", async (tier) => {
+    process.env.MASSIVE_DATA_TIER = tier;
+    fetchSpy.mockResolvedValueOnce(
+      mockResponse({
+        status: "OK",
+        request_id: "empty",
+        ticker: "O:SPX250107C05000000",
+        queryCount: 0,
+        results: [],
+      }),
+    );
+    const outcomes: unknown[] = [];
+    const quotes = await new MassiveProvider().fetchQuotes(
+      "SPX250107C05000000",
+      "2025-01-07",
+      "2025-01-07",
+      (outcome) => outcomes.push(outcome),
+    );
+    expect(quotes.size).toBe(0);
+    expect(outcomes).toEqual([{ date: "2025-01-07", outcome: "empty", pagesFetched: 1 }]);
+  });
+
+  it.each(["quotes", "ohlc"])(
+    "preserves multi-page rows with and without observer on %s",
+    async (tier) => {
+      process.env.MASSIVE_DATA_TIER = tier;
+      const base = {
+        status: "OK",
+        request_id: "page",
+        ticker: "O:SPX250107C05000000",
+        queryCount: 1,
+      };
+      const quote = {
+        bid_price: 12,
+        ask_price: 13,
+        bid_size: 1,
+        ask_size: 1,
+        sequence_number: 1,
+        sip_timestamp: 1736260200000 * 1_000_000,
+      };
+      const row = tier === "quotes" ? quote : { ...VALID_BAR, t: 1736260200000 };
+      const row2 =
+        tier === "quotes"
+          ? { ...quote, sip_timestamp: 1736260260000 * 1_000_000 }
+          : { ...VALID_BAR, t: 1736260260000 };
+      const run = async (observer?: (outcome: unknown) => void) => {
+        fetchSpy
+          .mockResolvedValueOnce(
+            mockResponse({ ...base, results: [row], next_url: "https://api.massive.com/page2" }),
+          )
+          .mockResolvedValueOnce(mockResponse({ ...base, results: [row2] }));
+        return new MassiveProvider().fetchQuotes(
+          "SPX250107C05000000",
+          "2025-01-07",
+          "2025-01-07",
+          observer,
+        );
+      };
+      const baseline = await run();
+      const outcomes: unknown[] = [];
+      const observed = await run((outcome) => outcomes.push(outcome));
+      const expected =
+        tier === "quotes"
+          ? { bid: 12, ask: 13, source: "nbbo" }
+          : { bid: 101, ask: 101, source: "synth_close" };
+      expect([...baseline]).toEqual([
+        ["2025-01-07 09:30", expected],
+        ["2025-01-07 09:31", expected],
+      ]);
+      expect([...observed]).toEqual([...baseline]);
+      expect(outcomes).toEqual([{ date: "2025-01-07", outcome: "ok", pagesFetched: 2 }]);
+    },
+  );
+
+  it("fetches exactly the requested calendar dates in Asia/Tokyo", () => {
+    const moduleUrl = pathToFileURL(
+      resolve(import.meta.dirname, "../../../src/utils/providers/massive.ts"),
+    ).href;
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `
+      import { MassiveProvider } from ${JSON.stringify(moduleUrl)};
+      const urls = [], receipts = [];
+      globalThis.fetch = async (url) => {
+        urls.push(url);
+        return new Response(JSON.stringify({ status: "OK", request_id: "r", results: [] }));
+      };
+      await new MassiveProvider().fetchQuotes("SPX250107C05000000", "2025-01-03", "2025-01-06", r => receipts.push(r));
+      console.log(JSON.stringify({ urls, receipts }));
+    `,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          TZ: "Asia/Tokyo",
+          MASSIVE_API_KEY: "test",
+          MASSIVE_DATA_TIER: "quotes",
+        },
+      },
+    );
+    expect(child.status).toBe(0);
+    const result = JSON.parse(child.stdout);
+    expect(
+      result.urls.map((url: string) => new URL(url).searchParams.get("timestamp.gte")),
+    ).toEqual(["2025-01-03T14:30:00Z", "2025-01-06T14:30:00Z"]);
+    expect(result.receipts.map((r: { date: string }) => r.date)).toEqual([
+      "2025-01-03",
+      "2025-01-06",
+    ]);
   });
 
   it("uses /v3/quotes endpoint when MASSIVE_DATA_TIER=quotes and tags rows as nbbo", async () => {
