@@ -147,9 +147,28 @@ before hard caps and admission, so it cannot override those limits or insolvency
 verified equal-package buying power; shared groups with unequal child buying
 power are refused. Supply unambiguous `entryGroupId`s within each member and
 `simultaneousOrder` containing every member exactly once. Times are zero-padded
-`HH:mm:ss` with optional fractional seconds; dates are market-calendar keys,
+`HH:mm:ss` with optional fractional seconds; dates are ET calendar dates (YYYY-MM-DD),
 not timestamps. Every in-window entry and close must lie on the supplied axis.
 An endpoint close beyond that axis remains open; no terminal mark is invented.
+
+Optional `sizingSchedule: Record<string, BookSizingScheduleEntry[]>` supplies
+strictly increasing ET calendar dates (YYYY-MM-DD) as `effectiveDate` per known member.
+Each entry declares complete `sizing`, `maxContractsPerTrade`,
+`maxAllocationAmount`, and `maxOpenTrades` (null means uncapped). The latest
+entry dated on or before a group's entry date replaces those fields; before
+the first date, the base member declaration applies. Entries do not inherit
+from earlier entries. Empty lists leave the base unchanged.
+`removed`, `ignoreMarginRequirements`, and `minimumOne` remain fixed member
+flags. Concurrency counts the real member's open groups across every segment,
+unlike a pseudo-member construction, where each segment has its own open count.
+Admitted groups retain their quantity and ordinary buying-power release rules
+across schedule changes; funds and marks use one continuous ledger. Member
+attribution remains per real member.
+The supplied schedule is echoed in `declarations`; duplicate/unsorted dates,
+unknown members, invalid sizing/caps and unsupported fields are refused.
+Effective dates need not appear on the replay's `dates` axis.
+Omitting the schedule preserves existing output. This is a library-only option,
+not an MCP tool argument.
 
 Optional `simultaneousGroupOrder: { [memberId]: [entryGroupId, ...] }` explicitly
 orders distinct entry groups of one member opening at the same timestamp.
